@@ -9,7 +9,7 @@ use {
 };
 
 use helpers::{
-    setup, setup_mint_and_extra_metas, create_ata, mint_tokens, build_transfer_with_hook_ix,
+    setup, setup_mint_and_extra_metas, create_ata, mint_tokens, build_transfer_with_hook_ix, send_ix,initialize_rate_limit,
 };
 
 #[test]
@@ -75,4 +75,54 @@ fn test_transfer_hook_rate_limit_exceeded() {
     let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[&payer]).unwrap();
     let res = svm.send_transaction(tx);
     assert!(res.is_err(), "Transfer exceeding rate limit should fail");
+}
+
+#[test]
+fn test_per_user_rate_limit_isolation() {
+    // 1. Setup LiteSVM, payer, and program_id
+    let (mut svm, payer, program_id) = setup();
+
+    // 2. Create and setup Mint & Extra Account Metas
+    let mint = Keypair::new();
+    setup_mint_and_extra_metas(&mut svm, &payer, &mint, &program_id);
+
+    // 3. Create User B keypair & fund with SOL
+    let user_b = Keypair::new();
+    svm.airdrop(&user_b.pubkey(), 1_000_000_000).unwrap();
+
+    // 4. Call initialize for User B so they get their own RateLimit PDA
+    initialize_rate_limit(&mut svm, &user_b, &mint, &program_id);
+
+    // 5. Create ATAs for User A (payer) and User B
+    let user_a_ata = create_ata(&mut svm, &payer, &payer.pubkey(), &mint.pubkey());
+    let user_b_ata = create_ata(&mut svm, &payer, &user_b.pubkey(), &mint.pubkey());
+
+    // 6. Mint tokens to both users
+    mint_tokens(&mut svm, &payer, &mint.pubkey(), &user_a_ata, 1_000_000);
+    mint_tokens(&mut svm, &payer, &mint.pubkey(), &user_b_ata, 1_000_000);
+
+    // 7. User A spends their full 1,000,000 limit
+    let tx_a = build_transfer_with_hook_ix(
+        &user_a_ata,
+        &user_b_ata,
+        &mint.pubkey(),
+        &payer.pubkey(),
+        &program_id,
+        1_000_000,
+        9,
+    );
+    send_ix(&mut svm, tx_a, &payer, &[&payer]);
+
+    // 8. User B spends 1,000,000 in the same hour
+    // (Succeeds because User B has an independent rate limit PDA)
+    let tx_b = build_transfer_with_hook_ix(
+        &user_b_ata,
+        &user_a_ata,
+        &mint.pubkey(),
+        &user_b.pubkey(),
+        &program_id,
+        1_000_000,
+        9,
+    );
+    send_ix(&mut svm, tx_b, &user_b, &[&user_b]);
 }
